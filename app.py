@@ -168,7 +168,7 @@ st.caption(f"Last update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
 # ============================================================
 # Tabs
 # ============================================================
-tab_signal, tab_log, tab_scanner, tab_system = st.tabs(["Current Signal", "Signal Log", "Multi-Bar Scanner", "System & Rules"])
+tab_signal, tab_paper, tab_log, tab_scanner, tab_system = st.tabs(["Current Signal", "Paper Trading", "Signal Log", "Multi-Bar Scanner", "System & Rules"])
 
 # ============================================================
 # TAB 1: Current Signal
@@ -265,7 +265,267 @@ with tab_signal:
         st.altair_chart(price_chart, use_container_width=True)
 
 # ============================================================
-# TAB 2: Signal Log (live model log on recent bars)
+# TAB 2: Paper Trading Simulation (Jan 1 2026 -> now)
+# ============================================================
+with tab_paper:
+    st.subheader("Paper Trading Simulation — Jan 1, 2026 to Present")
+    st.caption("Simulates $10,000 paper trading using Margin v2 (2.5x) on 5m bars since Jan 1, 2026")
+
+    pt_interval = st.selectbox("Backtest Interval", ["5m", "15m", "60m"], index=0, key="pt_interval")
+
+    # yfinance limits: 5m max 60 days, 15m max 60 days, 60m max 730 days
+    if pt_interval in ["5m", "15m"]:
+        pt_period = "60d"
+        pt_note = "Note: yfinance limits 5m/15m data to last 60 days"
+    else:
+        pt_period = "1y"
+        pt_note = "Using 1-year lookback for 60m interval"
+
+    st.info(pt_note)
+
+    @st.cache_data(ttl=300)
+    def download_backtest_data(ticker, period, intv):
+        raw = yf.download(ticker, period=period, interval=intv, progress=False, prepost=True)
+        return raw
+
+    with st.spinner("Downloading backtest data..."):
+        pt_raw = download_backtest_data(TICKER, pt_period, pt_interval)
+
+    if pt_raw is None or len(pt_raw) == 0:
+        st.error("No data available for backtest.")
+    else:
+        pt_df = normalize(pt_raw)
+
+        # Filter to 2026 only
+        pt_df = pt_df[pt_df["datetime"] >= "2026-01-01"].reset_index(drop=True)
+
+        if len(pt_df) < SEQ_LEN + 10:
+            st.warning(f"Not enough 2026 data. Only {len(pt_df)} bars available.")
+        else:
+            d_bt = compute_indicators(pt_df)
+
+            # Paper trading state
+            cash = INITIAL_CAPITAL
+            shares = 0.0
+            entry_price = 0.0
+            leverage_used = 0.0
+            trades = []
+            log_lines = []
+            equity_curve = []
+            margin_limit = INITIAL_CAPITAL * MARGIN_CONFIG["margin_ratio"]
+            total_interest = 0.0
+            stop_losses = 0
+            interval_hours = {"5m": 5/60, "15m": 0.25, "60m": 1.0}
+            hours = interval_hours.get(pt_interval, 5/60)
+
+            log_lines.append("=" * 70)
+            log_lines.append("  INTC MARGIN v2 — PAPER TRADING SIMULATION")
+            log_lines.append("=" * 70)
+            log_lines.append(f"Period: 2026-01-01 to present | Interval: {pt_interval}")
+            log_lines.append(f"Capital: $10,000 | Max Leverage: {MAX_LEVERAGE}x | Margin: 150%")
+            log_lines.append(f"Stop-Loss: 5% | Interest: 8%/yr | Threshold: {FORECAST_THRESHOLD*100:.2f}%")
+            log_lines.append(f"Total bars: {len(d_bt)}")
+            log_lines.append("-" * 70)
+
+            progress = st.progress(0)
+            log_placeholder = st.empty()
+            n_bars = len(d_bt) - SEQ_LEN
+
+            for i in range(n_bars):
+                idx = SEQ_LEN + i
+                window = d_bt.iloc[:idx + 1]
+                price = float(window["close"].iloc[-1])
+                bar_time = str(pt_df["datetime"].iloc[idx]) if idx < len(pt_df) else ""
+
+                # Charge interest
+                margin_used = max(0, -cash)
+                if margin_used > 0:
+                    interest = margin_used * MARGIN_CONFIG["margin_interest_annual"] / (252 * 6.5) * hours
+                    cash -= interest
+                    total_interest += interest
+
+                # Stop-loss check
+                if shares > 0:
+                    pnl_pct = (price - entry_price) / entry_price
+                    threshold = MARGIN_CONFIG["stop_loss_leveraged"] if leverage_used > 1.0 else MARGIN_CONFIG["stop_loss_base"]
+                    if pnl_pct < -threshold:
+                        proceeds = shares * price
+                        pnl = proceeds - (shares * entry_price)
+                        pnl_pct_val = pnl_pct * 100
+                        cash += proceeds
+                        trades.append({"time": bar_time, "entry": entry_price, "exit": price,
+                                       "shares": shares, "pnl": pnl, "pnl_pct": pnl_pct_val,
+                                       "leverage": leverage_used, "type": "STOP-LOSS"})
+                        log_lines.append(f"[{bar_time}] *** STOP-LOSS *** {shares:.1f}sh @ ${price:.4f} | "
+                                         f"PnL: ${pnl:+.2f} ({pnl_pct_val:+.2f}%) | Lev={leverage_used:.1f}x")
+                        shares = 0.0
+                        entry_price = 0.0
+                        leverage_used = 0.0
+                        stop_losses += 1
+                        equity_curve.append({"bar": i, "time": bar_time, "equity": cash, "price": price})
+                        continue
+
+                # Run model
+                feature_data = window[FEATURE_COLS].tail(SEQ_LEN).values
+                seq_scaled = scaler.transform(feature_data)
+                X_t = torch.tensor(seq_scaled, dtype=torch.float32).unsqueeze(0).to(device)
+                iv_id = torch.tensor([INTERVAL_IDS.get(pt_interval, 1)], dtype=torch.long).to(device)
+
+                with torch.no_grad():
+                    cls_logits, reg_pred, sizing_out = model(X_t, iv_id)
+                    probs = torch.softmax(cls_logits, dim=1)[0].cpu().numpy()
+                    pred_cls = cls_logits.argmax(1).item()
+                    forecast = reg_pred[0].cpu().numpy()
+                    model_sizing = float(sizing_out.squeeze().cpu().numpy())
+
+                cls_labels = {0: "SELL", 1: "HOLD", 2: "BUY"}
+                cls_label = cls_labels[pred_cls]
+                avg_ret = float(forecast.mean())
+                forecast_std = float(forecast.std())
+
+                if pred_cls == 2 and avg_ret > 0:
+                    sig = 1
+                elif pred_cls == 0 and avg_ret < 0:
+                    sig = -1
+                elif avg_ret > FORECAST_THRESHOLD:
+                    sig = 1
+                elif avg_ret < -FORECAST_THRESHOLD:
+                    sig = -1
+                else:
+                    sig = 0
+
+                rec_lev = model_sizing * MAX_LEVERAGE
+                heur_lev = compute_leverage(probs.tolist(), avg_ret, forecast_std, MAX_LEVERAGE)
+                target_lev = max(1.0, min(0.75 * rec_lev + 0.25 * heur_lev, MAX_LEVERAGE))
+
+                sig_name = {1: "BUY", -1: "SELL", 0: "HOLD"}[sig]
+
+                # Execute
+                if sig == 1 and shares == 0:
+                    eq = cash
+                    buying_pow = min(eq * target_lev, eq + margin_limit)
+                    shares = buying_pow / price
+                    cost = shares * price
+                    cash -= cost
+                    entry_price = price
+                    leverage_used = target_lev
+                    log_lines.append(f"[{bar_time}] === BUY {shares:.1f}sh @ ${price:.4f} | "
+                                     f"${cost:,.0f} | Lev={target_lev:.1f}x | "
+                                     f"Class={cls_label}({probs[2]:.0%}) Fcst={avg_ret*100:+.3f}%")
+
+                elif sig == -1 and shares > 0:
+                    proceeds = shares * price
+                    pnl = proceeds - (shares * entry_price)
+                    pnl_pct = (price - entry_price) / entry_price * 100
+                    cash += proceeds
+                    result = "WIN" if pnl > 0 else "LOSS"
+                    trades.append({"time": bar_time, "entry": entry_price, "exit": price,
+                                   "shares": shares, "pnl": pnl, "pnl_pct": pnl_pct,
+                                   "leverage": leverage_used, "type": "SIGNAL"})
+                    log_lines.append(f"[{bar_time}] === SELL {shares:.1f}sh @ ${price:.4f} | "
+                                     f"PnL: ${pnl:+.2f} ({pnl_pct:+.2f}%) [{result}] "
+                                     f"Lev={leverage_used:.1f}x | Class={cls_label} Fcst={avg_ret*100:+.3f}%")
+                    shares = 0.0
+                    entry_price = 0.0
+                    leverage_used = 0.0
+
+                # Track equity
+                eq_now = cash + shares * price
+                equity_curve.append({"bar": i, "time": bar_time, "equity": eq_now, "price": price})
+
+                # Update progress
+                if i % max(1, n_bars // 100) == 0:
+                    progress.progress(min(i / n_bars, 1.0))
+
+            progress.progress(1.0)
+
+            # Final equity
+            final_price = float(d_bt["close"].iloc[-1])
+            final_eq = cash + shares * final_price
+            total_pnl = final_eq - INITIAL_CAPITAL
+            total_pnl_pct = total_pnl / INITIAL_CAPITAL * 100
+            wins = sum(1 for t in trades if t["pnl"] > 0)
+            losses = sum(1 for t in trades if t["pnl"] <= 0)
+            win_rate = wins / len(trades) * 100 if trades else 0
+
+            # Buy & hold comparison
+            first_price = float(d_bt["close"].iloc[SEQ_LEN])
+            bh_return = (final_price - first_price) / first_price * 100
+
+            log_lines.append("")
+            log_lines.append("=" * 70)
+            log_lines.append("  SIMULATION COMPLETE")
+            log_lines.append("=" * 70)
+            log_lines.append(f"Final Equity: ${final_eq:,.2f} | P&L: ${total_pnl:+,.2f} ({total_pnl_pct:+.2f}%)")
+            log_lines.append(f"Trades: {len(trades)} | W/L: {wins}/{losses} ({win_rate:.0f}%)")
+            log_lines.append(f"Stop-Losses: {stop_losses} | Interest: ${total_interest:.2f}")
+            log_lines.append(f"Buy & Hold: {bh_return:+.2f}%")
+            if shares > 0:
+                log_lines.append(f"Open Position: {shares:.1f}sh @ ${entry_price:.4f} Lev={leverage_used:.1f}x")
+
+            # Summary KPIs
+            st.subheader("Results Summary")
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("Final Equity", f"${final_eq:,.2f}", f"{total_pnl:+,.2f} ({total_pnl_pct:+.2f}%)")
+            k2.metric("Trades", f"{len(trades)}", f"W:{wins} L:{losses}")
+            k3.metric("Win Rate", f"{win_rate:.0f}%")
+            k4.metric("Buy & Hold", f"{bh_return:+.2f}%")
+            k5.metric("Interest Paid", f"${total_interest:.2f}", f"Stops: {stop_losses}")
+
+            # Equity curve chart
+            if equity_curve:
+                st.subheader("Equity Curve")
+                eq_df = pd.DataFrame(equity_curve)
+
+                # Downsample for chart if too many points
+                if len(eq_df) > 500:
+                    step = len(eq_df) // 500
+                    eq_df_chart = eq_df.iloc[::step]
+                else:
+                    eq_df_chart = eq_df
+
+                eq_chart = alt.Chart(eq_df_chart).mark_line(color="gold", strokeWidth=2).encode(
+                    x=alt.X("bar:Q", title="Bar #"),
+                    y=alt.Y("equity:Q", title="Equity ($)", scale=alt.Scale(zero=False)),
+                ).properties(height=300)
+
+                bh_line = alt.Chart(eq_df_chart).mark_line(color="steelblue", strokeDash=[5,3]).encode(
+                    x="bar:Q",
+                    y=alt.Y("price:Q", title="INTC Price ($)", scale=alt.Scale(zero=False)),
+                )
+
+                st.altair_chart(eq_chart, use_container_width=True)
+
+                st.subheader("INTC Price")
+                st.altair_chart(bh_line, use_container_width=True)
+
+            # Trade table
+            if trades:
+                st.subheader("Trade Log")
+                t_df = pd.DataFrame(trades)
+                t_df_disp = t_df[["time", "entry", "exit", "shares", "pnl", "pnl_pct", "leverage", "type"]].copy()
+                t_df_disp.columns = ["Time", "Entry $", "Exit $", "Shares", "P&L $", "P&L %", "Leverage", "Type"]
+
+                def color_pnl(val):
+                    try:
+                        v = float(val)
+                        if v > 0: return "color: #00cc00"
+                        elif v < 0: return "color: #cc0000"
+                    except (ValueError, TypeError):
+                        pass
+                    return ""
+
+                styled_t = t_df_disp.style
+                for c in ["P&L $", "P&L %"]:
+                    styled_t = styled_t.applymap(color_pnl, subset=[c])
+                st.dataframe(styled_t, use_container_width=True, height=400)
+
+            # Full log
+            with st.expander("Full Trading Log"):
+                st.code("\n".join(log_lines), language="text")
+
+# ============================================================
+# TAB 3: Signal Log (live model log on recent bars)
 # ============================================================
 with tab_log:
     st.subheader("Live Signal Log")
