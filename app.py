@@ -87,7 +87,7 @@ def get_signal(model, scaler, device, df, interval_str):
         probs = torch.softmax(cls_logits, dim=1)[0].cpu().numpy()
         pred_cls = cls_logits.argmax(1).item()
         forecast = reg_pred[0].cpu().numpy()
-        model_sizing = float(sizing_out[0].cpu().numpy())
+        model_sizing = float(sizing_out.squeeze().cpu().numpy())
 
     cls_labels = {0: "SELL", 1: "HOLD", 2: "BUY"}
     cls_label = cls_labels[pred_cls]
@@ -294,7 +294,7 @@ with tab_scanner:
                 probs = torch.softmax(cls_logits, dim=1)[0].cpu().numpy()
                 pred_cls = cls_logits.argmax(1).item()
                 forecast = reg_pred[0].cpu().numpy()
-                model_sizing = float(sizing_out[0].cpu().numpy())
+                model_sizing = float(sizing_out.squeeze().cpu().numpy())
 
             avg_ret = float(forecast.mean())
             forecast_std = float(forecast.std())
