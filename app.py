@@ -168,7 +168,7 @@ st.caption(f"Last update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
 # ============================================================
 # Tabs
 # ============================================================
-tab_signal, tab_scanner, tab_system = st.tabs(["Current Signal", "Multi-Bar Scanner", "System & Rules"])
+tab_signal, tab_log, tab_scanner, tab_system = st.tabs(["Current Signal", "Signal Log", "Multi-Bar Scanner", "System & Rules"])
 
 # ============================================================
 # TAB 1: Current Signal
@@ -265,7 +265,175 @@ with tab_signal:
         st.altair_chart(price_chart, use_container_width=True)
 
 # ============================================================
-# TAB 2: Multi-Bar Scanner
+# TAB 2: Signal Log (live model log on recent bars)
+# ============================================================
+with tab_log:
+    st.subheader("Live Signal Log")
+    st.caption("Model runs on each recent bar — simulates what the paper trader sees in real-time")
+
+    n_log = st.slider("Number of bars to log", 10, 100, 30, key="log_slider")
+    d_log = compute_indicators(df)
+
+    if len(d_log) >= SEQ_LEN + n_log:
+        log_lines = []
+        log_data = []
+
+        for i in range(n_log):
+            idx = len(d_log) - n_log + i
+            window = d_log.iloc[:idx + 1]
+            if len(window) < SEQ_LEN:
+                continue
+
+            feature_data = window[FEATURE_COLS].tail(SEQ_LEN).values
+            seq_scaled = scaler.transform(feature_data)
+            X_t = torch.tensor(seq_scaled, dtype=torch.float32).unsqueeze(0).to(device)
+            iv_id = torch.tensor([INTERVAL_IDS.get(interval, 1)], dtype=torch.long).to(device)
+
+            with torch.no_grad():
+                cls_logits, reg_pred, sizing_out = model(X_t, iv_id)
+                probs = torch.softmax(cls_logits, dim=1)[0].cpu().numpy()
+                pred_cls = cls_logits.argmax(1).item()
+                forecast = reg_pred[0].cpu().numpy()
+                model_sizing = float(sizing_out.squeeze().cpu().numpy())
+
+            cls_labels = {0: "SELL", 1: "HOLD", 2: "BUY"}
+            cls_label = cls_labels[pred_cls]
+            avg_ret = float(forecast.mean())
+            forecast_std = float(forecast.std())
+
+            if pred_cls == 2 and avg_ret > 0:
+                sig = "BUY"
+            elif pred_cls == 0 and avg_ret < 0:
+                sig = "SELL"
+            elif avg_ret > FORECAST_THRESHOLD:
+                sig = "BUY"
+            elif avg_ret < -FORECAST_THRESHOLD:
+                sig = "SELL"
+            else:
+                sig = "HOLD"
+
+            rec_lev = model_sizing * MAX_LEVERAGE
+            heur_lev = compute_leverage(probs.tolist(), avg_ret, forecast_std, MAX_LEVERAGE)
+            target_lev = max(1.0, min(0.75 * rec_lev + 0.25 * heur_lev, MAX_LEVERAGE))
+
+            price = float(window["close"].iloc[-1])
+            bar_time = str(df["datetime"].iloc[-(n_log - i)])
+            fc_str = " | ".join(f"{v*100:+.3f}%" for v in forecast)
+
+            # Build log line
+            sig_icon = {"BUY": ">>>BUY<<<", "SELL": ">>>SELL<<<", "HOLD": "---HOLD---"}[sig]
+            line = (
+                f"[{bar_time}] INTC=${price:.4f}\n"
+                f"  SIGNAL: {sig_icon}\n"
+                f"  Classification: {cls_label} (SELL={probs[0]:.3f} HOLD={probs[1]:.3f} BUY={probs[2]:.3f})\n"
+                f"  Forecast: {fc_str}\n"
+                f"  Avg move: {avg_ret*100:+.4f}% | Std: {forecast_std*100:.4f}% | Sizing: {model_sizing:.3f}\n"
+                f"  Leverage: {target_lev:.2f}x (model: {rec_lev:.2f}x, heuristic: {heur_lev:.2f}x)\n"
+            )
+
+            # Check if classification disagrees with signal
+            if cls_label != sig:
+                line += f"  ** OVERRIDE: Class={cls_label} but Signal={sig} (regression forecast overrides)\n"
+
+            log_lines.append(line)
+            log_data.append({
+                "Time": bar_time, "Price": price, "Class": cls_label,
+                "Signal": sig, "Override": cls_label != sig,
+                "BUY%": probs[2], "SELL%": probs[0],
+                "Avg Move": avg_ret * 100, "Leverage": target_lev,
+            })
+
+        # Show raw log
+        st.code("\n".join(log_lines), language="text")
+
+        st.divider()
+
+        # Classification vs Signal Analysis
+        st.subheader("Classification vs Signal — When Do They Disagree?")
+
+        st.markdown("""
+        The model has **3 output heads** that can conflict with each other:
+
+        | Head | What it does | Example |
+        |------|-------------|---------|
+        | **Classification** (Head 1) | Pattern recognition: "This chart looks like a BUY/SELL/HOLD setup" | BUY 82% |
+        | **Regression** (Head 2) | Price forecast: "I predict the next 5 moves will be..." | -0.12%, -0.25%, -0.33%... |
+        | **Sizing** (Head 3) | Position sizing: "How confident am I? How much to bet?" | 0.35 |
+
+        **The Signal** is the **final decision** that combines Head 1 + Head 2:
+        """)
+
+        st.markdown("""
+        ```
+        IF class = BUY  AND forecast > 0     --> SIGNAL = BUY   (both agree: bullish)
+        IF class = SELL AND forecast < 0     --> SIGNAL = SELL  (both agree: bearish)
+        IF forecast > +0.05%                 --> SIGNAL = BUY   (strong forecast overrides)
+        IF forecast < -0.05%                 --> SIGNAL = SELL  (strong forecast overrides)
+        OTHERWISE                            --> SIGNAL = HOLD
+        ```
+        """)
+
+        st.info(
+            "**Key insight:** Classification sees *patterns* (\"this looks bullish\"), "
+            "while Regression predicts *actual returns* (\"but price will drop\"). "
+            "When they disagree, the regression forecast wins — this prevents buying into "
+            "patterns that historically looked bullish but the model's forward prediction says otherwise."
+        )
+
+        # Show override statistics
+        log_df = pd.DataFrame(log_data)
+        n_overrides = log_df["Override"].sum()
+        n_total = len(log_df)
+
+        col_o1, col_o2, col_o3 = st.columns(3)
+        col_o1.metric("Total Bars Analyzed", n_total)
+        col_o2.metric("Overrides (Class != Signal)", int(n_overrides))
+        col_o3.metric("Override Rate", f"{n_overrides/n_total*100:.0f}%" if n_total > 0 else "0%")
+
+        if n_overrides > 0:
+            st.markdown("**Override Details:**")
+            override_df = log_df[log_df["Override"]][["Time", "Price", "Class", "Signal", "Avg Move", "BUY%", "SELL%"]]
+            override_df.columns = ["Time", "Price", "Classification", "Final Signal", "Forecast %", "BUY Prob", "SELL Prob"]
+            override_df = override_df.iloc[::-1].reset_index(drop=True)
+
+            def color_cls(val):
+                if val == "BUY": return "background-color: #0d6e0d; color: white"
+                elif val == "SELL": return "background-color: #8b0000; color: white"
+                return ""
+
+            styled_o = override_df.style.applymap(color_cls, subset=["Classification", "Final Signal"])
+            st.dataframe(styled_o, use_container_width=True)
+
+            st.markdown("""
+            **Example from above:** When Classification says BUY (82%) but the 5-step forecast
+            is negative (-0.23%), the final Signal becomes SELL. The model sees a bullish *pattern*
+            but predicts the price will actually *drop* — so it refuses to buy. This is the safety
+            mechanism that prevents entering bad trades.
+            """)
+
+        # Signal vs Classification comparison chart
+        st.subheader("Signal vs Classification Distribution")
+        comp_data = []
+        for _, row in log_df.iterrows():
+            comp_data.append({"Type": "Classification", "Value": row["Class"]})
+            comp_data.append({"Type": "Final Signal", "Value": row["Signal"]})
+        comp_df = pd.DataFrame(comp_data)
+        comp_chart = alt.Chart(comp_df).mark_bar().encode(
+            x="Value:N",
+            y="count():Q",
+            color=alt.Color("Value:N", scale=alt.Scale(
+                domain=["BUY", "SELL", "HOLD"],
+                range=["#00cc00", "#cc0000", "#888888"]
+            ), legend=None),
+            column="Type:N",
+        ).properties(width=250, height=200)
+        st.altair_chart(comp_chart)
+
+    else:
+        st.warning(f"Not enough data for {n_log} bars.")
+
+# ============================================================
+# TAB 3: Multi-Bar Scanner
 # ============================================================
 with tab_scanner:
     st.subheader("Rolling Signal Scanner")
